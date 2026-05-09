@@ -1,25 +1,34 @@
 #!/usr/bin/env bash
 
 # =========================================================
-# NGINX + 3XUI (XRay) AUTO CONFIGURATOR
-# Relay / Backend mode
-# Supports:
+# NGINX + 3XUI (XRay) MANAGER
+# =========================================================
+#
+# FEATURES:
+#   - Auto install nginx/certbot
+#   - Relay mode
+#   - Backend mode
 #   - gRPC
 #   - WebSocket
 #   - SplitHTTP (XHTTP)
-#   - Let's Encrypt
-#   - Existing SSL certs
-#   - Probe resistance fake site
+#   - Fake website (probe resistance)
+#   - Route constructor
+#   - Safe route includes
+#   - No sed insertion bugs
+#   - No standalone certbot port 80 bug
 #
-# Tested:
-#   Ubuntu 22.04+
+# TESTED:
+#   Ubuntu 22+
 #   Debian 12+
+#
 # =========================================================
 
 set -e
 
 NGINX_DIR="/etc/nginx"
-SITES_DIR="$NGINX_DIR/conf.d"
+CONF_DIR="/etc/nginx/conf.d"
+ROUTES_DIR="/etc/nginx/routes"
+
 WWW_DIR="/var/www/fakesite"
 
 GREEN="\e[32m"
@@ -46,7 +55,12 @@ function require_root() {
     fi
 }
 
+# =========================================================
+# INSTALL
+# =========================================================
+
 function install_packages() {
+
     apt update
 
     apt install -y \
@@ -58,19 +72,26 @@ function install_packages() {
         cron
 
     systemctl enable nginx
-    systemctl start nginx
+    systemctl restart nginx
 
     ok "Packages installed"
 }
 
+# =========================================================
+# FAKE SITE
+# =========================================================
+
 function create_fake_site() {
+
     mkdir -p "$WWW_DIR"
 
     cat > "$WWW_DIR/index.html" <<EOF
 <!DOCTYPE html>
 <html>
 <head>
+<meta charset="utf-8">
 <title>Welcome</title>
+
 <style>
 body {
     background:#f5f5f5;
@@ -79,22 +100,65 @@ body {
     text-align:center;
 }
 </style>
+
 </head>
+
 <body>
+
 <h1>Welcome to nginx!</h1>
-<p>Server is working.</p>
+<p>Server is running.</p>
+
 </body>
 </html>
 EOF
 
-    ok "Fake site created"
+    ok "Fake website created"
 }
+
+# =========================================================
+# ASK DOMAIN
+# =========================================================
 
 function ask_domain() {
-    read -rp "Domain: " DOMAIN
+
+    echo
+
+    read -rp "$(echo -e ${CYAN}Введите домен:${NC} )" DOMAIN
 }
 
+# =========================================================
+# CREATE TEMP HTTP CONFIG
+# Needed for certbot --nginx
+# =========================================================
+
+function create_temp_http_config() {
+
+    cat > "$CONF_DIR/$DOMAIN-temp.conf" <<EOF
+server {
+
+    listen 80;
+    server_name $DOMAIN;
+
+    root $WWW_DIR;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+}
+EOF
+
+    nginx -t
+    systemctl reload nginx
+
+    ok "Temporary HTTP config created"
+}
+
+# =========================================================
+# SSL
+# =========================================================
+
 function ssl_menu() {
+
     echo
     echo "1) Generate Let's Encrypt certificate"
     echo "2) Use existing certificate"
@@ -103,14 +167,19 @@ function ssl_menu() {
 
     if [[ "$SSL_MODE" == "1" ]]; then
 
+        create_temp_http_config
+
         certbot --nginx \
             -d "$DOMAIN" \
+            --redirect \
             --non-interactive \
             --agree-tos \
             -m admin@"$DOMAIN"
 
         CERT="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
         KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+
+        rm -f "$CONF_DIR/$DOMAIN-temp.conf"
 
     else
 
@@ -126,18 +195,31 @@ function ssl_menu() {
     ok "SSL configured"
 }
 
-function mode_menu() {
-    echo
-    echo "1) Relay mode"
-    echo "2) Backend mode"
+# =========================================================
+# MODE MENU
+# =========================================================
 
-    read -rp "Select: " MODE
+function mode_menu() {
+
+    echo
+    echo -e "${GREEN}Режим работы:${NC}"
+    echo
+
+    echo -e "${WHITE}1) Relay (Проксирующий сервер)${NC}"
+    echo -e "${WHITE}2) Backend (Сервер с 3XUI)${NC}"
+
+    echo
+
+    read -rp "$(echo -e ${CYAN}Выберите режим:${NC} )" MODE
 }
+
+# =========================================================
+# TRANSPORT MENU
+# =========================================================
 
 function transport_menu() {
 
     echo
-    echo "Transport:"
     echo "1) gRPC"
     echo "2) WebSocket"
     echo "3) SplitHTTP (XHTTP)"
@@ -146,161 +228,26 @@ function transport_menu() {
 
     read -rp "Route path (example /grpc): " PATH_NAME
 
+    ROUTE_NAME=$(echo "$PATH_NAME" | tr -d '/')
+
     if [[ "$MODE" == "1" ]]; then
         read -rp "Backend domain/IP: " BACKEND
-    fi
-
-    if [[ "$MODE" == "2" ]]; then
+    else
         read -rp "Local Xray port: " LOCAL_PORT
     fi
 }
 
-function build_grpc_location() {
+# =========================================================
+# MAIN NGINX CONFIG
+# =========================================================
 
-if [[ "$MODE" == "1" ]]; then
+function create_main_nginx_config() {
 
-cat <<EOF
-location $PATH_NAME {
+    mkdir -p "$ROUTES_DIR/$DOMAIN"
 
-    if (\$content_type !~ "application/grpc") {
-        return 404;
-    }
-
-    grpc_socket_keepalive on;
-    grpc_read_timeout 1h;
-    grpc_send_timeout 1h;
-
-    grpc_pass grpcs://$BACKEND:443;
-
-    grpc_ssl_server_name on;
-    grpc_ssl_name $BACKEND;
-}
-EOF
-
-else
-
-cat <<EOF
-location $PATH_NAME {
-
-    if (\$content_type !~ "application/grpc") {
-        return 404;
-    }
-
-    grpc_socket_keepalive on;
-    grpc_read_timeout 1h;
-    grpc_send_timeout 1h;
-
-    grpc_pass grpc://127.0.0.1:$LOCAL_PORT;
-}
-EOF
-
-fi
-}
-
-function build_ws_location() {
-
-if [[ "$MODE" == "1" ]]; then
-
-cat <<EOF
-location $PATH_NAME {
-
-    proxy_redirect off;
-    proxy_http_version 1.1;
-
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
-
-    proxy_set_header Host $BACKEND;
-
-    proxy_pass https://$BACKEND;
-}
-EOF
-
-else
-
-cat <<EOF
-location $PATH_NAME {
-
-    proxy_redirect off;
-    proxy_http_version 1.1;
-
-    proxy_set_header Upgrade \$http_upgrade;
-    proxy_set_header Connection "upgrade";
-
-    proxy_pass http://127.0.0.1:$LOCAL_PORT;
-}
-EOF
-
-fi
-}
-
-function build_xhttp_location() {
-
-if [[ "$MODE" == "1" ]]; then
-
-cat <<EOF
-location $PATH_NAME {
-
-    proxy_buffering off;
-    proxy_request_buffering off;
-
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-
-    proxy_set_header Host $BACKEND;
-
-    proxy_pass https://$BACKEND;
-
-    proxy_ssl_server_name on;
-    proxy_ssl_name $BACKEND;
-}
-EOF
-
-else
-
-cat <<EOF
-location $PATH_NAME {
-
-    proxy_buffering off;
-    proxy_request_buffering off;
-
-    proxy_http_version 1.1;
-    proxy_set_header Connection "";
-
-    proxy_pass http://127.0.0.1:$LOCAL_PORT;
-}
-EOF
-
-fi
-}
-
-function generate_transport_block() {
-
-    case "$TRANSPORT" in
-        1)
-            build_grpc_location
-            ;;
-        2)
-            build_ws_location
-            ;;
-        3)
-            build_xhttp_location
-            ;;
-        *)
-            err "Invalid transport"
-            exit 1
-            ;;
-    esac
-}
-
-function create_nginx_config() {
-
-CONF="$SITES_DIR/$DOMAIN.conf"
-
-TRANSPORT_BLOCK=$(generate_transport_block)
-
-cat > "$CONF" <<EOF
+    cat > "$CONF_DIR/$DOMAIN.conf" <<EOF
 server {
+
     listen 80;
     server_name $DOMAIN;
 
@@ -326,63 +273,272 @@ server {
         try_files \$uri \$uri/ =404;
     }
 
-$TRANSPORT_BLOCK
+    include $ROUTES_DIR/$DOMAIN/*.conf;
 }
 EOF
 
     nginx -t
+    systemctl reload nginx
 
-    systemctl restart nginx
-
-    ok "Nginx config created"
+    ok "Main nginx config created"
 }
+
+# =========================================================
+# GENERATE ROUTE
+# =========================================================
+
+function create_grpc_route() {
+
+    if [[ "$MODE" == "1" ]]; then
+
+cat > "$ROUTES_DIR/$DOMAIN/$ROUTE_NAME.conf" <<EOF
+location $PATH_NAME {
+
+    if (\$content_type !~ "application/grpc") {
+        return 404;
+    }
+
+    grpc_socket_keepalive on;
+
+    grpc_read_timeout 1h;
+    grpc_send_timeout 1h;
+
+    grpc_pass grpcs://$BACKEND:443;
+
+    grpc_ssl_server_name on;
+    grpc_ssl_name $BACKEND;
+}
+EOF
+
+    else
+
+cat > "$ROUTES_DIR/$DOMAIN/$ROUTE_NAME.conf" <<EOF
+location $PATH_NAME {
+
+    if (\$content_type !~ "application/grpc") {
+        return 404;
+    }
+
+    grpc_socket_keepalive on;
+
+    grpc_read_timeout 1h;
+    grpc_send_timeout 1h;
+
+    grpc_pass grpc://127.0.0.1:$LOCAL_PORT;
+}
+EOF
+
+    fi
+}
+
+# =========================================================
+# WS
+# =========================================================
+
+function create_ws_route() {
+
+    if [[ "$MODE" == "1" ]]; then
+
+cat > "$ROUTES_DIR/$DOMAIN/$ROUTE_NAME.conf" <<EOF
+location $PATH_NAME {
+
+    proxy_redirect off;
+
+    proxy_http_version 1.1;
+
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+
+    proxy_set_header Host $BACKEND;
+
+    proxy_pass https://$BACKEND;
+
+    proxy_ssl_server_name on;
+    proxy_ssl_name $BACKEND;
+}
+EOF
+
+    else
+
+cat > "$ROUTES_DIR/$DOMAIN/$ROUTE_NAME.conf" <<EOF
+location $PATH_NAME {
+
+    proxy_redirect off;
+
+    proxy_http_version 1.1;
+
+    proxy_set_header Upgrade \$http_upgrade;
+    proxy_set_header Connection "upgrade";
+
+    proxy_pass http://127.0.0.1:$LOCAL_PORT;
+}
+EOF
+
+    fi
+}
+
+# =========================================================
+# XHTTP
+# =========================================================
+
+function create_xhttp_route() {
+
+    if [[ "$MODE" == "1" ]]; then
+
+cat > "$ROUTES_DIR/$DOMAIN/$ROUTE_NAME.conf" <<EOF
+location $PATH_NAME {
+
+    proxy_buffering off;
+    proxy_request_buffering off;
+
+    proxy_http_version 1.1;
+
+    proxy_set_header Connection "";
+
+    proxy_set_header Host $BACKEND;
+
+    proxy_pass https://$BACKEND;
+
+    proxy_ssl_server_name on;
+    proxy_ssl_name $BACKEND;
+}
+EOF
+
+    else
+
+cat > "$ROUTES_DIR/$DOMAIN/$ROUTE_NAME.conf" <<EOF
+location $PATH_NAME {
+
+    proxy_buffering off;
+    proxy_request_buffering off;
+
+    proxy_http_version 1.1;
+
+    proxy_set_header Connection "";
+
+    proxy_pass http://127.0.0.1:$LOCAL_PORT;
+}
+EOF
+
+    fi
+}
+
+# =========================================================
+# CREATE ROUTE
+# =========================================================
+
+function create_route() {
+
+    case "$TRANSPORT" in
+
+        1)
+            create_grpc_route
+            ;;
+
+        2)
+            create_ws_route
+            ;;
+
+        3)
+            create_xhttp_route
+            ;;
+
+        *)
+            err "Invalid transport"
+            exit 1
+            ;;
+    esac
+
+    nginx -t
+    systemctl reload nginx
+
+    ok "Route added"
+}
+
+# =========================================================
+# ADD ROUTE
+# =========================================================
 
 function add_route() {
 
     ask_domain
 
-    CONF="$SITES_DIR/$DOMAIN.conf"
-
-    if [[ ! -f "$CONF" ]]; then
-        err "Config not found"
+    if [[ ! -f "$CONF_DIR/$DOMAIN.conf" ]]; then
+        err "Domain config not found"
         exit 1
     fi
 
     mode_menu
     transport_menu
 
-    BLOCK=$(generate_transport_block)
-
-    sed -i "/^}/i $BLOCK" "$CONF"
-
-    nginx -t
-    systemctl restart nginx
-
-    ok "Route added"
+    create_route
 }
+
+# =========================================================
+# FULL INSTALL
+# =========================================================
+
+function full_install() {
+
+    install_packages
+
+    mkdir -p "$ROUTES_DIR"
+
+    create_fake_site
+
+    ask_domain
+
+    ssl_menu
+
+    create_main_nginx_config
+
+    mode_menu
+
+    transport_menu
+
+    create_route
+
+    ok "Installation completed"
+}
+
+# =========================================================
+# COLORS
+# =========================================================
+
+GREEN="\e[32m"
+RED="\e[31m"
+YELLOW="\e[33m"
+CYAN="\e[36m"
+WHITE="\e[97m"
+BOLD="\e[1m"
+NC="\e[0m"
+
+# =========================================================
+# MENU
+# =========================================================
 
 function menu() {
 
-    echo
-    echo "========== 3XUI NGINX MANAGER =========="
-    echo
-    echo "1) Full install"
-    echo "2) Add route"
-    echo "3) Exit"
+    clear
+
+    echo -e "${GREEN}${BOLD}"
+    echo "==========================================="
+    echo "         NGINX + 3XUI MANAGER"
+    echo "==========================================="
+    echo -e "${NC}"
+
+    echo -e "${WHITE}1) Полная установка${NC}"
+    echo -e "${WHITE}2) Добавить маршрут${NC}"
+    echo -e "${WHITE}3) Выход${NC}"
+
     echo
 
-    read -rp "Select: " ACTION
+    read -rp "$(echo -e ${CYAN}Выберите пункт:${NC} )" ACTION
 
     case "$ACTION" in
 
         1)
-            install_packages
-            create_fake_site
-            ask_domain
-            ssl_menu
-            mode_menu
-            transport_menu
-            create_nginx_config
+            full_install
             ;;
 
         2)
@@ -394,10 +550,9 @@ function menu() {
             ;;
 
         *)
-            err "Invalid option"
+            err "Неверный пункт"
             ;;
     esac
 }
-
 require_root
 menu
